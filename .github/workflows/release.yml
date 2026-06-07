@@ -31,10 +31,22 @@ jobs:
 
       - name: Package dmg (drag-to-Applications installer)
         run: |
+          brew install create-dmg
           mkdir -p dmg-root
           cp -R dist/EchoType.app dmg-root/
-          ln -s /Applications dmg-root/Applications
-          hdiutil create -volname "EchoType" -srcfolder dmg-root -ov -format UDZO dist/EchoType.dmg
+          create-dmg \
+            --volname "EchoType" \
+            --volicon Resources/AppIcon.icns \
+            --background Resources/dmg-background.tiff \
+            --window-pos 200 150 \
+            --window-size 660 400 \
+            --icon-size 128 \
+            --text-size 13 \
+            --icon "EchoType.app" 165 200 \
+            --app-drop-link 495 200 \
+            --hide-extension "EchoType.app" \
+            --no-internet-enable \
+            dist/EchoType.dmg dmg-root
           cd dist
           shasum -a 256 EchoType.dmg > EchoType.dmg.sha256
 
