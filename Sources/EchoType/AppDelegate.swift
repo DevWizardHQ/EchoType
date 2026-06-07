@@ -26,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let tapThreshold: TimeInterval = 0.35      // press shorter than this = a tap
     private let doubleTapWindow: TimeInterval = 0.45   // max gap between the two taps
     private var loginMenuItem: NSMenuItem?
+    private var engagementFailures = 0  // consecutive; 2+ triggers a page reload
     private var loggedIn = true { // optimistic until the webview says otherwise
         didSet { updateLoginMenuItem() }
     }
@@ -338,6 +339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 switch result {
                 case .success:
+                    self.engagementFailures = 0
                     NSSound(named: "Pop")?.play()
                     self.web.unmuteMicrophoneIfNeeded()
                     if self.wantsHandsFree {
@@ -458,7 +460,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .timeout:
             message = "ChatGPT didn't respond in time"
         case .buttonNotFound(let status):
-            message = "ChatGPT page changed (\(status)) — see log"
+            // The page wedges occasionally (dictation click stops engaging).
+            // One failure can be a hiccup — only reload after two in a row.
+            engagementFailures += 1
+            if engagementFailures >= 2 {
+                message = "Dictation glitched (\(status)) — reloading ChatGPT, try again"
+                Log.write("dictation: \(engagementFailures) engagement failures, reloading webview to self-heal")
+                engagementFailures = 0
+                web.reloadInBackground()
+            } else {
+                message = "Dictation didn't start — try again"
+            }
         case .notReady:
             message = "ChatGPT page isn't ready yet"
         case .javascript(let detail):

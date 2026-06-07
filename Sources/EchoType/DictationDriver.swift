@@ -379,6 +379,59 @@ final class DictationDriver {
         Log.write("driver: native click at css(\(Int(cssPoint.x)),\(Int(cssPoint.y))) window(\(Int(windowPoint.x)),\(Int(windowPoint.y)))")
     }
 
+    // MARK: - Native keyboard shortcuts
+    //
+    // chatgpt.com ships dictation shortcuts: ⌃⇧D toggles start/submit, Esc
+    // cancels. Far more robust than click synthesis (no coordinates, no
+    // selectors, no React pointer-event quirks) — clicks remain the fallback.
+
+    private func sendDictationShortcut() {
+        sendKey(keyCode: 2, characters: "D", ignoringModifiers: "d", modifiers: [.control, .shift])
+        Log.write("driver: sent ⌃⇧D")
+    }
+
+    private func sendEscape() {
+        sendKey(keyCode: 53, characters: "\u{1B}", ignoringModifiers: "\u{1B}", modifiers: [])
+        Log.write("driver: sent Esc")
+    }
+
+    private func sendKey(keyCode: UInt16, characters: String, ignoringModifiers: String,
+                         modifiers: NSEvent.ModifierFlags) {
+        guard let webView, let window = webView.window else { return }
+        func keyEvent(_ type: NSEvent.EventType) -> NSEvent? {
+            NSEvent.keyEvent(
+                with: type, location: .zero, modifierFlags: modifiers,
+                timestamp: ProcessInfo.processInfo.systemUptime,
+                windowNumber: window.windowNumber, context: nil,
+                characters: characters, charactersIgnoringModifiers: ignoringModifiers,
+                isARepeat: false, keyCode: keyCode
+            )
+        }
+        // Straight to the responder methods — the window is never key, so
+        // window.sendEvent would drop the events.
+        if let down = keyEvent(.keyDown) { webView.keyDown(with: down) }
+        if let up = keyEvent(.keyUp) { webView.keyUp(with: up) }
+    }
+
+    /// Polls until the dictation UI is gone (or deadline); reports whether it's still up.
+    private func pollWhileDictating(deadline: Date, completion: @escaping (Bool) -> Void) {
+        state { [weak self] result in
+            guard case .success(let state) = result else {
+                completion(false)
+                return
+            }
+            if !state.dictating {
+                completion(false)
+            } else if Date() > deadline {
+                completion(true)
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    self?.pollWhileDictating(deadline: deadline, completion: completion)
+                }
+            }
+        }
+    }
+
     // MARK: - Swift wrappers
 
     private func call(_ expression: String, completion: @escaping (Result<String, Failure>) -> Void) {
@@ -442,23 +495,31 @@ final class DictationDriver {
                 }
                 // Clear leftovers so the composer holds exactly this dictation's text.
                 self.call("window.__echotype.clearComposer()") { _ in
-                    // Native click first: grants WebKit user activation (required
-                    // for mic/AudioContext). If the React handler misses it, follow
-                    // up with a synthetic pointer sequence that React reliably sees —
-                    // the activation from the native click is still fresh.
-                    self.nativeClick(kind: "start") { result in
-                        switch result {
-                        case .failure(let error):
-                            completion(.failure(error))
-                        case .success:
-                            self.awaitEngagement(deadline: Date().addingTimeInterval(1.2), forensics: false) { firstTry in
-                                if case .success = firstTry {
-                                    completion(.success(()))
-                                    return
-                                }
-                                Log.write("driver: native click didn't engage, retrying via JS pointer events")
-                                self.call("window.__echotype.jsClick('start')") { _ in
-                                    self.awaitEngagement(deadline: Date().addingTimeInterval(3), completion: completion)
+                    // ⌃⇧D is chatgpt.com's own dictation shortcut — most reliable.
+                    // Falls back to a native click, then a JS pointer sequence.
+                    DispatchQueue.main.async {
+                        self.sendDictationShortcut()
+                        self.awaitEngagement(deadline: Date().addingTimeInterval(1.5), forensics: false) { keyTry in
+                            if case .success = keyTry {
+                                completion(.success(()))
+                                return
+                            }
+                            Log.write("driver: shortcut didn't engage, retrying via native click")
+                            self.nativeClick(kind: "start") { result in
+                                switch result {
+                                case .failure(let error):
+                                    completion(.failure(error))
+                                case .success:
+                                    self.awaitEngagement(deadline: Date().addingTimeInterval(1.5), forensics: false) { clickTry in
+                                        if case .success = clickTry {
+                                            completion(.success(()))
+                                            return
+                                        }
+                                        Log.write("driver: native click didn't engage, retrying via JS pointer events")
+                                        self.call("window.__echotype.jsClick('start')") { _ in
+                                            self.awaitEngagement(deadline: Date().addingTimeInterval(4), completion: completion)
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -478,26 +539,35 @@ final class DictationDriver {
                 if state.dictating {
                     completion(.success(()))
                 } else if Date() > deadline {
-                    if forensics {
-                        Log.write("driver: dictation never engaged (gum=\(state.gum) ua=\(state.userActivation) lastClick=\(state.lastClick))")
-                        self?.call("JSON.stringify(window.__etLogs || [])") { logs in
-                            if case .success(let text) = logs {
-                                Log.write("driver: page console: \(text.prefix(1500))")
-                            }
-                        }
-                        self?.call("window.__echotype.dialogs()") { dialogs in
-                            if case .success(let text) = dialogs {
-                                Log.write("driver: dialogs on page: \(text.prefix(500))")
-                            }
-                        }
-                        self?.call("await window.__echotype.testMic()") { mic in
-                            if case .success(let text) = mic {
-                                Log.write("driver: direct mic test: \(text)")
-                            }
-                        }
-                        self?.logButtonDump(context: "not-engaged gum=\(state.gum)")
+                    let fail = { completion(.failure(.buttonNotFound("mic didn't start: \(state.gum)"))) }
+                    guard forensics else {
+                        fail()
+                        return
                     }
-                    completion(.failure(.buttonNotFound("mic didn't start: \(state.gum)")))
+                    Log.write("driver: dictation never engaged (gum=\(state.gum) ua=\(state.userActivation) lastClick=\(state.lastClick))")
+                    if let webView = self?.webView, let window = webView.window {
+                        Log.write("driver: window visible=\(window.isVisible) occlusionVisible=\(window.occlusionState.contains(.visible)) alpha=\(window.alphaValue) onActiveSpace=\(window.isOnActiveSpace)")
+                    } else {
+                        Log.write("driver: window MISSING at failure")
+                    }
+                    self?.call("JSON.stringify(window.__etLogs || [])") { logs in
+                        if case .success(let text) = logs {
+                            Log.write("driver: page console: \(text.prefix(1500))")
+                        }
+                    }
+                    self?.call("window.__echotype.dialogs()") { dialogs in
+                        if case .success(let text) = dialogs {
+                            Log.write("driver: dialogs on page: \(text.prefix(500))")
+                        }
+                    }
+                    // rAF is the key evidence — wait for it BEFORE reporting failure,
+                    // so recovery (which may tear the page down) can't race it away.
+                    self?.call("await window.__echotype.rafTest()") { raf in
+                        if case .success(let text) = raf {
+                            Log.write("driver: render pipeline: \(text)")
+                        }
+                        fail()
+                    }
                 } else {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                         self?.awaitEngagement(deadline: deadline, forensics: forensics, completion: completion)
@@ -508,15 +578,37 @@ final class DictationDriver {
     }
 
     func submitDictation(completion: @escaping (Result<Void, Failure>) -> Void) {
-        nativeClick(kind: "submit", completion: completion)
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.sendDictationShortcut() // ⌃⇧D toggles: submits while dictating
+            self.pollWhileDictating(deadline: Date().addingTimeInterval(1.5)) { stillDictating in
+                if stillDictating {
+                    Log.write("driver: shortcut didn't submit, falling back to click")
+                    self.nativeClick(kind: "submit", completion: completion)
+                } else {
+                    completion(.success(()))
+                }
+            }
+        }
     }
 
     func cancelDictation(completion: ((Result<Void, Failure>) -> Void)? = nil) {
-        nativeClick(kind: "cancel") { result in
-            if case .failure(let error) = result {
-                Log.write("driver: cancel -> \(error)")
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.sendEscape()
+            self.pollWhileDictating(deadline: Date().addingTimeInterval(1.5)) { stillDictating in
+                guard stillDictating else {
+                    completion?(.success(()))
+                    return
+                }
+                Log.write("driver: Esc didn't cancel, falling back to click")
+                self.nativeClick(kind: "cancel") { result in
+                    if case .failure(let error) = result {
+                        Log.write("driver: cancel -> \(error)")
+                    }
+                    completion?(result)
+                }
             }
-            completion?(result)
         }
     }
 

@@ -79,6 +79,15 @@ final class ChatGPTWebController: NSObject {
         endActivity()
     }
 
+    /// Tears the page down and reloads it in the background — recovery path for
+    /// when chatgpt.com's dictation state machine wedges (click stops engaging).
+    func reloadInBackground() {
+        unload()
+        ensureReady { result in
+            Log.write("webview: self-heal reload -> \(result)")
+        }
+    }
+
     /// Resets the keep-warm idle countdown (call on every dictation).
     func touch() {
         idleTimer?.invalidate()
