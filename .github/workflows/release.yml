@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build app bundle
+        run: ./scripts/build-app.sh release
+
+      - name: Stamp version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" dist/EchoType.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" dist/EchoType.app/Contents/Info.plist
+          codesign --force --sign - --identifier com.devwizardhq.echotype dist/EchoType.app
+
+      - name: Package
+        run: |
+          cd dist
+          ditto -c -k --keepParent EchoType.app EchoType.zip
+          shasum -a 256 EchoType.zip > EchoType.zip.sha256
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          # Fall back to a generic note if the version is missing from the changelog.
+          if ! grep -q '[^[:space:]]' release-notes.md; then
+            echo "EchoType $VERSION" > release-notes.md
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "EchoType ${GITHUB_REF_NAME#v}" \
+            --notes-file release-notes.md \
+            dist/EchoType.zip dist/EchoType.zip.sha256
