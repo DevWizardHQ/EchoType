@@ -23,11 +23,20 @@ jobs:
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" dist/EchoType.app/Contents/Info.plist
           codesign --force --sign - --identifier com.devwizardhq.echotype dist/EchoType.app
 
-      - name: Package
+      - name: Package zip (used by in-app self-update)
         run: |
           cd dist
           ditto -c -k --keepParent EchoType.app EchoType.zip
           shasum -a 256 EchoType.zip > EchoType.zip.sha256
+
+      - name: Package dmg (drag-to-Applications installer)
+        run: |
+          mkdir -p dmg-root
+          cp -R dist/EchoType.app dmg-root/
+          ln -s /Applications dmg-root/Applications
+          hdiutil create -volname "EchoType" -srcfolder dmg-root -ov -format UDZO dist/EchoType.dmg
+          cd dist
+          shasum -a 256 EchoType.dmg > EchoType.dmg.sha256
 
       - name: Extract release notes from CHANGELOG
         run: |
@@ -49,4 +58,5 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "EchoType ${GITHUB_REF_NAME#v}" \
             --notes-file release-notes.md \
+            dist/EchoType.dmg dist/EchoType.dmg.sha256 \
             dist/EchoType.zip dist/EchoType.zip.sha256

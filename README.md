@@ -35,8 +35,8 @@ Pure Swift, single binary, zero external dependencies. ~150–250 MB while the p
 
 ### Download (recommended)
 
-1. Grab `EchoType.zip` from the [latest release](https://github.com/DevWizardHQ/EchoType/releases/latest).
-2. Unzip and move `EchoType.app` to `/Applications`.
+1. Grab `EchoType.dmg` from the [latest release](https://github.com/DevWizardHQ/EchoType/releases/latest).
+2. Open it and drag **EchoType** onto the **Applications** shortcut.
 3. First launch: the app is not notarized, so **right-click → Open → Open** (only needed once). Alternatively:
    ```sh
    xattr -dr com.apple.quarantine /Applications/EchoType.app
