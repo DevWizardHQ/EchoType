@@ -13,15 +13,37 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # A STABLE signing identity (same cert every release) is what lets macOS
+      # TCC permissions (Accessibility, Microphone) survive app updates —
+      # ad-hoc signing changes identity per build and resets permissions.
+      - name: Import signing certificate
+        env:
+          CERT_P12: ${{ secrets.SIGNING_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.SIGNING_CERT_P12_PASSWORD }}
+        run: |
+          echo "$CERT_P12" | base64 -d > cert.p12
+          security create-keychain -p ci-temp build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p ci-temp build.keychain
+          security set-keychain-settings -lut 3600 build.keychain
+          security import cert.p12 -k build.keychain -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k ci-temp build.keychain >/dev/null
+          # Trust the self-signed cert for code signing so the identity is valid.
+          openssl pkcs12 -in cert.p12 -clcerts -nokeys -passin "pass:$CERT_PASSWORD" -out cert.pem
+          sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain cert.pem
+          rm cert.p12 cert.pem
+          security find-identity -v -p codesigning build.keychain
+
       - name: Build app bundle
         run: ./scripts/build-app.sh release
 
-      - name: Stamp version from tag
+      - name: Stamp version from tag and sign
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" dist/EchoType.app/Contents/Info.plist
           /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VERSION" dist/EchoType.app/Contents/Info.plist
-          codesign --force --sign - --identifier com.devwizardhq.echotype dist/EchoType.app
+          codesign --force --sign "DevWizardHQ Release" --identifier com.devwizardhq.echotype dist/EchoType.app
+          codesign --verify --verbose=2 dist/EchoType.app
 
       - name: Package zip (used by in-app self-update)
         run: |
