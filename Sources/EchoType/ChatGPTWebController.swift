@@ -24,6 +24,23 @@ final class ChatGPTWebController: NSObject {
     /// Set when login state changes; AppDelegate uses it to tint the menu icon.
     var onLoginStateChange: ((Bool) -> Void)?
 
+    override init() {
+        super.init()
+        // Display layout changes can strand the parked window fully offscreen,
+        // which freezes WebKit — re-park it whenever screens change.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self, let window = self.window, !self.loginWindowVisible else { return }
+            self.applyHiddenWindowMode(window)
+        }
+    }
+
+    /// Wired by AppDelegate: true while a dictation is in flight. The keep-warm
+    /// idle unload must never fire mid-dictation (sessions can run 30+ min).
+    var isBusy: (() -> Bool)?
+
     // MARK: - Lifecycle
 
     func applyPolicyAtLaunch() {
@@ -94,7 +111,12 @@ final class ChatGPTWebController: NSObject {
         idleTimer = nil
         guard Settings.webviewPolicy == .keepWarm, webView != nil || loading else { return }
         idleTimer = Timer.scheduledTimer(withTimeInterval: Settings.keepWarmDuration, repeats: false) { [weak self] _ in
-            self?.unload()
+            guard let self else { return }
+            if self.isBusy?() == true {
+                self.touch() // dictating — restart the countdown instead of unloading
+            } else {
+                self.unload()
+            }
         }
     }
 
@@ -118,6 +140,7 @@ final class ChatGPTWebController: NSObject {
         ensureReady { _ in } // make sure there is a page to log into
         guard let window else { return }
         window.alphaValue = 1
+        window.hasShadow = true
         window.level = .normal
         window.ignoresMouseEvents = false
         window.center()
@@ -136,8 +159,17 @@ final class ChatGPTWebController: NSObject {
     /// blocks chatgpt.com's mic capture. Floating + 1% alpha keeps capture alive.
     private func applyHiddenWindowMode(_ window: NSWindow) {
         window.alphaValue = 0.01
+        window.hasShadow = false // a near-invisible window still casts a visible shadow
         window.level = .floating
         window.ignoresMouseEvents = true
+        // Park the window almost entirely offscreen (a 2-pt column stays on the
+        // bottom-right edge) so even the 1% ghost can't sit over the user's work.
+        // Some part MUST stay on screen: fully offscreen = occluded = WebKit
+        // freezes the page and dictation dies.
+        if let screen = NSScreen.main {
+            let f = screen.frame
+            window.setFrameOrigin(NSPoint(x: f.maxX - 2, y: f.minY + 40 - window.frame.height))
+        }
         window.orderFrontRegardless()
     }
 
@@ -273,7 +305,7 @@ final class ChatGPTWebController: NSObject {
     /// orderOut) keeps WebKit from throttling timers and media capture.
     private func ensureWindow(contains webView: WKWebView) {
         if window == nil {
-            let window = NSWindow(
+            let window = OffscreenCapableWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
                 styleMask: [.titled, .closable, .resizable],
                 backing: .buffered,
@@ -282,7 +314,11 @@ final class ChatGPTWebController: NSObject {
             window.title = "EchoType — ChatGPT Login"
             window.isReleasedWhenClosed = false
             window.delegate = self
-            window.collectionBehavior = [.fullScreenAuxiliary, .ignoresCycle]
+            // .canJoinAllSpaces is load-bearing: without it the window stays on
+            // the Space it was created on; after the user switches Space the
+            // WindowServer marks it occluded and WebKit freezes the page —
+            // which silently kills chatgpt.com's dictation.
+            window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
             self.window = window
         }
         window?.contentView = webView
@@ -353,6 +389,15 @@ final class ChatGPTWebController: NSObject {
             ProcessInfo.processInfo.endActivity(token)
             activityToken = nil
         }
+    }
+}
+
+/// AppKit normally constrains titled windows onto the screen; hidden mode needs
+/// to park the webview window almost entirely OFF screen (with a 2-pt sliver
+/// left visible so WebKit keeps rendering).
+private final class OffscreenCapableWindow: NSWindow {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
+        frameRect
     }
 }
 

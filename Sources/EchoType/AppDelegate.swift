@@ -49,6 +49,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         hud.onCancel = { [weak self] in self?.cancelFromHUD() }
         hud.onSubmit = { [weak self] in self?.submitFromHUD() }
+        web.isBusy = { [weak self] in
+            if case .idle = self?.phase ?? .idle { return false }
+            return true
+        }
 
         web.onLoginStateChange = { [weak self] loggedIn in
             DispatchQueue.main.async {
@@ -413,7 +417,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 switch result {
                 case .success:
-                    self.collectTranscript()
+                    self.collectTranscript(
+                        recordingDuration: self.holdStartedAt.map { Date().timeIntervalSince($0) } ?? 0
+                    )
                 case .failure(let error):
                     self.handleFailure(error)
                 }
@@ -421,8 +427,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func collectTranscript() {
-        web.driver?.awaitTranscript { [weak self] result in
+    private func collectTranscript(recordingDuration: TimeInterval = 0) {
+        web.driver?.awaitTranscript(recordingDuration: recordingDuration) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else { return }
                 switch result {

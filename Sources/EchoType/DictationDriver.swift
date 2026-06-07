@@ -16,6 +16,7 @@ final class DictationDriver {
     struct PageState {
         let loggedIn: Bool
         let dictating: Bool
+        let composerPresent: Bool  // absent while ChatGPT is still transcribing
         let composerText: String
         let gum: String            // last getUserMedia outcome: none | requested | ok | err:<name>:<msg>
         let userActivation: String // none | active | had | unsupported
@@ -121,6 +122,7 @@ final class DictationDriver {
           E.state = () => JSON.stringify({
             loggedIn: E.loggedIn(),
             dictating: E.isDictating(),
+            composerPresent: !!E.composer(),
             text: E.composerText(),
             gum: window.__etGUM || 'none',
             ua: navigator.userActivation
@@ -467,6 +469,7 @@ final class DictationDriver {
                 completion(.success(PageState(
                     loggedIn: obj["loggedIn"] as? Bool ?? false,
                     dictating: obj["dictating"] as? Bool ?? false,
+                    composerPresent: obj["composerPresent"] as? Bool ?? false,
                     composerText: obj["text"] as? String ?? "",
                     gum: obj["gum"] as? String ?? "none",
                     userActivation: obj["ua"] as? String ?? "?",
@@ -582,11 +585,24 @@ final class DictationDriver {
             guard let self else { return }
             self.sendDictationShortcut() // ⌃⇧D toggles: submits while dictating
             self.pollWhileDictating(deadline: Date().addingTimeInterval(1.5)) { stillDictating in
-                if stillDictating {
-                    Log.write("driver: shortcut didn't submit, falling back to click")
-                    self.nativeClick(kind: "submit", completion: completion)
-                } else {
+                guard stillDictating else {
                     completion(.success(()))
+                    return
+                }
+                Log.write("driver: shortcut didn't submit, falling back to click")
+                self.nativeClick(kind: "submit") { result in
+                    switch result {
+                    case .success:
+                        completion(.success(()))
+                    case .failure(.buttonNotFound):
+                        // The submit button vanishing right after ⌃⇧D means the
+                        // shortcut DID land and the UI moved on to transcribing —
+                        // the awaitTranscript poller will pick the text up.
+                        Log.write("driver: submit button gone — treating as submitted")
+                        completion(.success(()))
+                    case .failure(let error):
+                        completion(.failure(error))
+                    }
                 }
             }
         }
@@ -619,9 +635,17 @@ final class DictationDriver {
     /// Polls the composer after submit until the transcript settles: dictation UI
     /// gone and text unchanged across two consecutive polls. Empty text after the
     /// dictation UI disappears (plus a grace period) resolves to "".
-    func awaitTranscript(timeout: TimeInterval = 20,
+    /// Waits for ChatGPT to finish transcribing and the text to settle in the
+    /// composer. There is NO fixed overall cap tied to recording length —
+    /// dictations can run 30+ minutes. Instead the deadline is an inactivity
+    /// window that keeps extending while the page shows progress (dictation UI
+    /// up, composer still detached, or text still changing).
+    func awaitTranscript(recordingDuration: TimeInterval = 0,
                          completion: @escaping (Result<String, Failure>) -> Void) {
-        let deadline = Date().addingTimeInterval(timeout)
+        // Whisper transcribes faster than realtime; half the recording length
+        // plus a generous floor covers slow networks.
+        let inactivityWindow = max(60, recordingDuration * 0.5)
+        var deadline = Date().addingTimeInterval(inactivityWindow)
         var lastText = ""
         var stableCount = 0
         var emptyGrace = 0
@@ -637,7 +661,11 @@ final class DictationDriver {
                         completion(.failure(.timeout))
                         return
                     }
-                    if !state.dictating {
+                    if state.dictating || !state.composerPresent {
+                        // Still recording-UI or transcribing (composer detached):
+                        // progress, not silence — keep the deadline fresh.
+                        deadline = Date().addingTimeInterval(inactivityWindow)
+                    } else {
                         if !state.composerText.isEmpty && state.composerText == lastText {
                             stableCount += 1
                             if stableCount >= 2 {
@@ -645,14 +673,16 @@ final class DictationDriver {
                                 return
                             }
                         } else if state.composerText.isEmpty {
-                            // Transcription may still be in flight briefly after the UI closes.
+                            // Composer is back and empty — transcript may land a
+                            // beat later, but an empty result is real after ~3s.
                             emptyGrace += 1
-                            if emptyGrace >= 12 { // ~3s of confirmed emptiness
+                            if emptyGrace >= 12 {
                                 completion(.success(""))
                                 return
                             }
                         } else {
                             stableCount = 0
+                            deadline = Date().addingTimeInterval(inactivityWindow) // text still arriving
                         }
                     }
                     lastText = state.composerText
