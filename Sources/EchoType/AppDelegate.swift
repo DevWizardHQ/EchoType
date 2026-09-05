@@ -4,10 +4,10 @@ import SwiftUI
 
 enum AppPhase {
     case idle
-    case waking                       // webview loading before the mic can open
-    case engaging                     // mic opening (dictation click in flight)
-    case listening(handsFree: Bool)   // hold mode, or hands-free after a double-tap
-    case pendingDoubleTap             // quick tap; mic stays open briefly awaiting a 2nd tap
+    case waking
+    case engaging
+    case listening(handsFree: Bool)
+    case pendingDoubleTap
     case transcribing
 }
 
@@ -21,13 +21,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var holdStartedAt: Date?
     private var releasedAt: Date?
     private var hotkeyHeld = false
-    private var wantsHandsFree = false  // 2nd press arrived while the mic was still opening
+    private var wantsHandsFree = false
     private var pendingTapTimer: Timer?
-    private let tapThreshold: TimeInterval = 0.35      // press shorter than this = a tap
-    private let doubleTapWindow: TimeInterval = 0.45   // max gap between the two taps
+    private let tapThreshold: TimeInterval = 0.35
+    private let doubleTapWindow: TimeInterval = 0.45
     private var loginMenuItem: NSMenuItem?
     private var engagementFailures = 0  // consecutive; 2+ triggers a page reload
-    private var loggedIn = true { // optimistic until the webview says otherwise
+    private var loggedIn = true {
+        didSet { updateLoginMenuItem() }
+    }
+    private var isOnline = true {
         didSet { updateLoginMenuItem() }
     }
 
@@ -43,8 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if !AXIsProcessTrusted() {
             promptForAccessibility()
         }
-        // Always poll: AXIsProcessTrusted can report a stale grant (old signature)
-        // while the event tap still fails. Keep trying until the tap installs.
+        // AXIsProcessTrusted can report a stale grant; poll until the tap installs.
         startHotkeyMonitorWithRetry()
 
         hud.onCancel = { [weak self] in self?.cancelFromHUD() }
@@ -58,17 +60,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 self?.loggedIn = loggedIn
                 self?.updateStatusIcon()
-                if !loggedIn {
-                    self?.web.showLoginWindow()
-                }
+            }
+        }
+        web.onReachabilityChange = { [weak self] online in
+            DispatchQueue.main.async {
+                self?.isOnline = online
+                self?.updateStatusIcon()
             }
         }
         web.applyPolicyAtLaunch()
         UpdateManager.shared.startAutomaticChecks()
 
-        // DIAG: ECHOTYPE_DIAG=1 runs the dictation forensics once the page is up,
-        // no hotkey needed, then quits. ECHOTYPE_DIAG=visible runs it with the
-        // login window shown (rendering unthrottled) to compare.
+        // ECHOTYPE_DIAG=1|flow|visible: run dictation forensics once up, then quit.
         if let diagMode = ProcessInfo.processInfo.environment["ECHOTYPE_DIAG"] {
             if diagMode == "visible" { web.showLoginWindow() }
             web.ensureReady { [weak self] result in
@@ -80,7 +83,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     }
                     self?.web.logWindowState()
                     if diagMode == "flow" {
-                        // Exercise the REAL dictation path end to end (minus speech).
                         DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                             self?.web.driver?.startDictation { result in
                                 Log.write("diag: flow startDictation -> \(result)")
@@ -135,11 +137,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let url = Bundle.main.url(forResource: "MenuBarIcon", withExtension: "png"),
               let image = NSImage(contentsOf: url) else { return nil }
         image.size = NSSize(width: 18, height: 18)
-        image.isTemplate = false // full-color logo
+        image.isTemplate = false
         return image
     }()
 
     private func updateStatusIcon() {
+        if !isOnline {
+            setSymbolIcon("wifi.slash", description: "EchoType offline", tint: .systemOrange)
+            return
+        }
         if !loggedIn {
             setSymbolIcon("person.crop.circle.badge.exclamationmark",
                           description: "EchoType logged out", tint: .systemRed)
@@ -164,7 +170,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func updateLoginMenuItem() {
         guard let item = loginMenuItem else { return }
-        if loggedIn {
+        if !isOnline {
+            item.title = "No internet connection — retry"
+            item.image = NSImage(systemSymbolName: "wifi.slash", accessibilityDescription: "Offline")
+        } else if loggedIn {
             item.title = "ChatGPT: Logged In ✓ (open window)"
             item.image = NSImage(systemSymbolName: "person.crop.circle.badge.checkmark",
                                  accessibilityDescription: "Logged in")
@@ -197,7 +206,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Triggers the system Accessibility prompt and opens the settings pane.
     private func promptForAccessibility() {
         let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
@@ -206,8 +214,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// Tries to install the event tap; on failure retries every 2s until it
-    /// succeeds (e.g. the user grants Accessibility while we wait). No relaunch needed.
     private func startHotkeyMonitorWithRetry() {
         accessibilityPollTimer?.invalidate()
         if startHotkeyMonitorOnce() {
@@ -220,20 +226,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             timer.invalidate()
             self.accessibilityPollTimer = nil
             Log.write("hotkey: event tap installed after grant")
-            NSSound(named: "Glass")?.play() // audible "ready" cue
+            NSSound(named: "Glass")?.play()
         }
     }
 
     // MARK: - Hotkey
 
-    /// Called from Settings when the hotkey changes.
     func startHotkeyMonitor() {
         if !startHotkeyMonitorOnce() {
             startHotkeyMonitorWithRetry()
         }
     }
 
-    /// Called from Settings when the webview policy changes.
     func webviewPolicyChanged() {
         web.policyChanged()
     }
@@ -251,11 +255,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Dictation flow
-    //
-    // Two ways to dictate with the same hotkey:
-    //   HOLD:       press & hold → talk → release → transcribe.
-    //   HANDS-FREE: double-tap → talk freely → single tap → transcribe.
-    // While transcribing, every key event is ignored — one dictation at a time.
+    // HOLD: press-hold-release. HANDS-FREE: double-tap, tap again to stop.
 
     private func onHotkeyDown() {
         switch phase {
@@ -267,12 +267,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.write("dictation: key down")
             startDictationSession()
         case .waking, .engaging:
-            // Second press while the mic is still opening → user wants hands-free.
             hotkeyHeld = true
             wantsHandsFree = true
             Log.write("dictation: second press while opening → hands-free")
         case .pendingDoubleTap:
-            // Second tap in time → hands-free mode; the mic never stopped listening.
             pendingTapTimer?.invalidate()
             pendingTapTimer = nil
             hotkeyHeld = true
@@ -280,7 +278,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             hud.show(state: .listening(handsFree: true))
             Log.write("dictation: hands-free engaged")
         case .listening(handsFree: true):
-            // Tap while hands-free → stop & transcribe.
             Log.write("dictation: hands-free stop tap")
             finishListening()
         case .listening(handsFree: false), .transcribing:
@@ -296,14 +293,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         switch phase {
         case .listening(handsFree: false):
             if heldDuration < tapThreshold {
-                // Quick tap — keep listening briefly in case a second tap follows.
                 enterPendingDoubleTap()
             } else {
                 finishListening()
             }
         case .waking, .engaging:
-            // The ensureReady/engagement callbacks decide what to do based on
-            // hotkeyHeld / wantsHandsFree / releasedAt.
             Log.write("dictation: released while \(phase)")
         default:
             break
@@ -322,8 +316,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 switch result {
                 case .success:
-                    // Proceed if the key is still down or a double-tap was queued;
-                    // a lone short tap that ended while the page was waking is discarded.
                     guard self.hotkeyHeld || self.wantsHandsFree else {
                         Log.write("dictation: released before ready, discarded")
                         self.resetToIdle()
@@ -353,15 +345,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.phase = .listening(handsFree: false)
                         self.hud.show(state: .listening(handsFree: false))
                     } else {
-                        // Released while the mic was opening.
                         let pressLength = (self.releasedAt ?? Date()).timeIntervalSince(self.holdStartedAt ?? Date())
                         if pressLength < self.tapThreshold {
-                            // Was a tap — give the second tap a chance.
                             self.phase = .listening(handsFree: false)
                             self.hud.show(state: .listening(handsFree: false))
                             self.enterPendingDoubleTap()
                         } else {
-                            // Was a hold that ended during engagement — wrap up immediately.
                             self.phase = .listening(handsFree: false)
                             self.finishListening()
                         }
@@ -384,7 +373,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// ✕ on the HUD pill.
     private func cancelFromHUD() {
         switch phase {
         case .listening, .pendingDoubleTap, .engaging:
@@ -396,7 +384,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// ✓ on the HUD pill.
     private func submitFromHUD() {
         switch phase {
         case .listening, .pendingDoubleTap:
@@ -433,7 +420,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self else { return }
                 switch result {
                 case .success(let transcript):
-                    // Always clear so nothing lingers in the ChatGPT composer.
                     self.web.driver?.clearComposer()
                     self.web.touch()
                     guard !transcript.isEmpty else {
@@ -442,11 +428,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         self.resetToIdle()
                         return
                     }
-                    Log.write("dictation: pasting \(transcript.count) chars")
+                    Log.write("dictation: delivering \(transcript.count) chars")
                     HistoryStore.shared.add(transcript)
-                    Paster.paste(transcript)
-                    NSSound(named: "Tink")?.play()
-                    self.resetToIdle()
+                    switch Paster.deliver(transcript) {
+                    case .pasted:
+                        NSSound(named: "Tink")?.play()
+                        self.resetToIdle()
+                    case .copiedToClipboard:
+                        Log.write("dictation: no editable field focused, left on clipboard")
+                        NSSound(named: "Tink")?.play()
+                        self.hud.show(state: .info("Copied to clipboard — press ⌘V to paste"))
+                        self.phase = .idle
+                    }
                 case .failure(let error):
                     self.web.driver?.cancelDictation()
                     self.web.driver?.clearComposer()
@@ -460,14 +453,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let message: String
         switch error {
         case .loggedOut:
-            message = "Logged out of ChatGPT — log in to continue"
+            message = "Logged out — open the EchoType menu to log in"
             loggedIn = false
-            web.showLoginWindow()
+        case .offline:
+            message = "No internet connection — check your network"
+            isOnline = false
         case .timeout:
             message = "ChatGPT didn't respond in time"
         case .buttonNotFound(let status):
-            // The page wedges occasionally (dictation click stops engaging).
-            // One failure can be a hiccup — only reload after two in a row.
+            // The page wedges occasionally; only reload after two failures in a row.
             engagementFailures += 1
             if engagementFailures >= 2 {
                 message = "Dictation glitched (\(status)) — reloading ChatGPT, try again"

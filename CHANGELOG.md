@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-09-05
+
+### Fixed
+
+- No-network handling: a dictation or login attempt while offline no longer opens a blank, frozen window and hangs for 25 seconds. Connectivity is monitored, offline is detected immediately, and the app fails fast with a clear message.
+- Login window reopen loop: the ChatGPT login window is no longer auto-opened on every logged-out check (which re-centered the window and stole focus repeatedly on a fresh install). It now opens only from the menu bar, on user action.
+
+### Added
+
+- Clipboard fallback for dictation: if an editable text field is focused, the transcript is pasted as before; if nothing editable is focused, it is left on the clipboard (with a "Copied to clipboard" notice) instead of being lost.
+- Offline placeholder page with a Retry button, shown in the login window when there is no connection, plus automatic recovery when the network returns.
+- Menu-bar offline indicator (icon and menu item) and a matching HUD message.
+
 ## [1.0.1] - 2026-06-07
 
 ### Fixed

@@ -1,18 +1,16 @@
 import AppKit
 import SwiftUI
 
-/// A floating, non-activating HUD near the bottom of the screen, styled like
-/// ChatGPT/Wispr's dictation pill: ✕ cancel — live waveform — ✓ submit.
-/// Buttons are clickable without stealing focus from the target app.
+/// Floating, non-activating dictation pill: ✕ cancel — waveform — ✓ submit.
 final class HUDController {
     enum HUDState {
-        case starting                    // webview waking up before the mic can open
-        case listening(handsFree: Bool)  // hands-free = double-tap mode, tap again to stop
+        case starting
+        case listening(handsFree: Bool)
         case transcribing
+        case info(String)
         case error(String)
     }
 
-    /// Wired by AppDelegate: ✕ and ✓ taps on the pill.
     var onCancel: (() -> Void)?
     var onSubmit: (() -> Void)?
 
@@ -43,7 +41,6 @@ final class HUDController {
         }
         guard let panel else { return }
 
-        // Only the listening pill has buttons; other states pass clicks through.
         if case .listening = state {
             panel.ignoresMouseEvents = false
         } else {
@@ -62,11 +59,13 @@ final class HUDController {
         }
         panel.orderFrontRegardless()
 
-        // Errors auto-dismiss; other states are hidden explicitly by the state machine.
-        if case .error = state {
+        switch state {
+        case .error, .info:
             autoHideTimer = Timer.scheduledTimer(withTimeInterval: 4, repeats: false) { [weak self] _ in
                 self?.hide()
             }
+        default:
+            break
         }
     }
 
@@ -77,14 +76,11 @@ final class HUDController {
     }
 }
 
-/// Lets pill buttons react to the first click even though the panel never
-/// becomes the key window.
 private final class FirstMouseHostingView<Content: View>: NSHostingView<Content> {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
-/// A panel that can never take keyboard focus: clicking ✕/✓ must leave the
-/// user's text field focused so the paste lands where they were typing.
+/// Never takes keyboard focus, so ✕/✓ clicks leave the target field focused.
 private final class NonFocusPanel: NSPanel {
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
@@ -131,6 +127,13 @@ private struct HUDView: View {
                     Text("Transcribing…")
                         .foregroundStyle(.white)
                 }
+            case .info(let message):
+                HStack(spacing: 8) {
+                    Image(systemName: "doc.on.clipboard")
+                        .foregroundStyle(.white)
+                    Text(message)
+                        .foregroundStyle(.white)
+                }
             case .error(let message):
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -149,7 +152,6 @@ private struct HUDView: View {
     }
 }
 
-/// Round ✕ / ✓ button matching ChatGPT's dictation pill.
 private struct PillButton: View {
     let symbol: String
     let prominent: Bool
@@ -168,8 +170,6 @@ private struct PillButton: View {
     }
 }
 
-/// Animated audio-style bars. Purely decorative (the real audio lives inside
-/// the webview), but gives the Wispr-like "it's hearing you" feedback.
 private struct WaveformView: View {
     private let barCount = 11
 
@@ -190,7 +190,6 @@ private struct WaveformView: View {
         }
     }
 
-    /// Taller in the middle, shorter at the edges — mic-meter silhouette.
     private func heightCap(_ index: Int) -> Double {
         let center = Double(barCount - 1) / 2
         let distance = abs(Double(index) - center) / center
