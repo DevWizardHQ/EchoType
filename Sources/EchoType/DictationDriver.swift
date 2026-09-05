@@ -1,26 +1,25 @@
 import Foundation
 import WebKit
 
-/// JS bridge to chatgpt.com's dictation UI inside the hidden webview.
-/// All DOM specifics come from `Selectors`; this file owns the JS plumbing
-/// and the Swift-side async wrappers.
+/// JS bridge to chatgpt.com's dictation UI. DOM specifics live in `Selectors`.
 final class DictationDriver {
     enum Failure: Error {
         case notReady
         case loggedOut
         case buttonNotFound(String)
         case timeout
+        case offline
         case javascript(String)
     }
 
     struct PageState {
         let loggedIn: Bool
         let dictating: Bool
-        let composerPresent: Bool  // absent while ChatGPT is still transcribing
+        let composerPresent: Bool
         let composerText: String
-        let gum: String            // last getUserMedia outcome: none | requested | ok | err:<name>:<msg>
+        let gum: String            // getUserMedia outcome: none | requested | ok | err:<name>:<msg>
         let userActivation: String // none | active | had | unsupported
-        let lastClick: String      // last click the page received, for click-synthesis debugging
+        let lastClick: String
     }
 
     private weak var webView: WKWebView?
@@ -29,9 +28,7 @@ final class DictationDriver {
         self.webView = webView
     }
 
-    /// The injected helper namespace. Added as a WKUserScript at document end,
-    /// and re-asserted before each call (SPA navigations keep window state, but
-    /// this makes the driver immune to hard reloads).
+    /// Injected helper namespace, re-asserted before each call (survives hard reloads).
     static var userScript: String {
         """
         (function () {
@@ -326,11 +323,8 @@ final class DictationDriver {
     }
 
     // MARK: - Native click synthesis
-    //
-    // WebKit only grants user activation (required for mic capture / AudioContext)
-    // to REAL input events — JS element.click() silently leaves the page without
-    // activation and ChatGPT's dictation never starts. So buttons are pressed by
-    // sending genuine NSEvents into the (invisible) window at the button's location.
+    // WebKit grants user activation (needed for mic/AudioContext) only to real
+    // input events, so buttons are pressed with genuine NSEvents, not JS .click().
 
     private func nativeClick(kind: String, completion: @escaping (Result<Void, Failure>) -> Void) {
         call("window.__echotype.centerOf('\(kind)')") { [weak self] result in
@@ -358,8 +352,7 @@ final class DictationDriver {
 
     private func sendClick(to webView: WKWebView, cssPoint: CGPoint) {
         guard let window = webView.window else { return }
-        // CSS viewport coords are top-left based; convert through the view so
-        // flippedness is handled for us.
+        // CSS coords are top-left based; convert through the view for flippedness.
         let viewPoint = webView.isFlipped
             ? cssPoint
             : CGPoint(x: cssPoint.x, y: webView.bounds.height - cssPoint.y)
@@ -373,19 +366,14 @@ final class DictationDriver {
                 eventNumber: 0, clickCount: 1, pressure: 1
             )
         }
-        // Deliver straight to the web view's responder methods: window.sendEvent
-        // on a non-key window treats the click as "first mouse" and swallows it
-        // before the DOM ever sees it.
+        // Straight to the view's responder: window.sendEvent swallows first-mouse clicks.
         if let down = mouseEvent(.leftMouseDown) { webView.mouseDown(with: down) }
         if let up = mouseEvent(.leftMouseUp) { webView.mouseUp(with: up) }
         Log.write("driver: native click at css(\(Int(cssPoint.x)),\(Int(cssPoint.y))) window(\(Int(windowPoint.x)),\(Int(windowPoint.y)))")
     }
 
     // MARK: - Native keyboard shortcuts
-    //
-    // chatgpt.com ships dictation shortcuts: ⌃⇧D toggles start/submit, Esc
-    // cancels. Far more robust than click synthesis (no coordinates, no
-    // selectors, no React pointer-event quirks) — clicks remain the fallback.
+    // ⌃⇧D toggles start/submit, Esc cancels — more robust than click synthesis.
 
     private func sendDictationShortcut() {
         sendKey(keyCode: 2, characters: "D", ignoringModifiers: "d", modifiers: [.control, .shift])
@@ -409,8 +397,6 @@ final class DictationDriver {
                 isARepeat: false, keyCode: keyCode
             )
         }
-        // Straight to the responder methods — the window is never key, so
-        // window.sendEvent would drop the events.
         if let down = keyEvent(.keyDown) { webView.keyDown(with: down) }
         if let up = keyEvent(.keyUp) { webView.keyUp(with: up) }
     }
@@ -441,7 +427,6 @@ final class DictationDriver {
             completion(.failure(.notReady))
             return
         }
-        // Re-assert the namespace, then call. Cheap no-op when already present.
         let js = Self.userScript + "\nreturn String(\(expression));"
         webView.callAsyncJavaScript(js, arguments: [:], in: nil, in: .page) { result in
             switch result {
@@ -496,10 +481,8 @@ final class DictationDriver {
                     completion(.success(()))
                     return
                 }
-                // Clear leftovers so the composer holds exactly this dictation's text.
                 self.call("window.__echotype.clearComposer()") { _ in
-                    // ⌃⇧D is chatgpt.com's own dictation shortcut — most reliable.
-                    // Falls back to a native click, then a JS pointer sequence.
+                    // Try ⌃⇧D, then native click, then JS pointer sequence.
                     DispatchQueue.main.async {
                         self.sendDictationShortcut()
                         self.awaitEngagement(deadline: Date().addingTimeInterval(1.5), forensics: false) { keyTry in
@@ -563,8 +546,7 @@ final class DictationDriver {
                             Log.write("driver: dialogs on page: \(text.prefix(500))")
                         }
                     }
-                    // rAF is the key evidence — wait for it BEFORE reporting failure,
-                    // so recovery (which may tear the page down) can't race it away.
+                    // Wait for rAF evidence before reporting failure (recovery can race it).
                     self?.call("await window.__echotype.rafTest()") { raf in
                         if case .success(let text) = raf {
                             Log.write("driver: render pipeline: \(text)")
@@ -583,7 +565,7 @@ final class DictationDriver {
     func submitDictation(completion: @escaping (Result<Void, Failure>) -> Void) {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.sendDictationShortcut() // ⌃⇧D toggles: submits while dictating
+            self.sendDictationShortcut()
             self.pollWhileDictating(deadline: Date().addingTimeInterval(1.5)) { stillDictating in
                 guard stillDictating else {
                     completion(.success(()))
@@ -595,9 +577,7 @@ final class DictationDriver {
                     case .success:
                         completion(.success(()))
                     case .failure(.buttonNotFound):
-                        // The submit button vanishing right after ⌃⇧D means the
-                        // shortcut DID land and the UI moved on to transcribing —
-                        // the awaitTranscript poller will pick the text up.
+                        // Submit button gone right after ⌃⇧D = it landed; transcript follows.
                         Log.write("driver: submit button gone — treating as submitted")
                         completion(.success(()))
                     case .failure(let error):
@@ -632,18 +612,10 @@ final class DictationDriver {
         call("window.__echotype.clearComposer()") { _ in completion?() }
     }
 
-    /// Polls the composer after submit until the transcript settles: dictation UI
-    /// gone and text unchanged across two consecutive polls. Empty text after the
-    /// dictation UI disappears (plus a grace period) resolves to "".
-    /// Waits for ChatGPT to finish transcribing and the text to settle in the
-    /// composer. There is NO fixed overall cap tied to recording length —
-    /// dictations can run 30+ minutes. Instead the deadline is an inactivity
-    /// window that keeps extending while the page shows progress (dictation UI
-    /// up, composer still detached, or text still changing).
+    /// Polls until the transcript settles. No fixed cap (dictations run 30+ min);
+    /// the deadline is an inactivity window that extends while the page shows progress.
     func awaitTranscript(recordingDuration: TimeInterval = 0,
                          completion: @escaping (Result<String, Failure>) -> Void) {
-        // Whisper transcribes faster than realtime; half the recording length
-        // plus a generous floor covers slow networks.
         let inactivityWindow = max(60, recordingDuration * 0.5)
         var deadline = Date().addingTimeInterval(inactivityWindow)
         var lastText = ""
@@ -662,8 +634,6 @@ final class DictationDriver {
                         return
                     }
                     if state.dictating || !state.composerPresent {
-                        // Still recording-UI or transcribing (composer detached):
-                        // progress, not silence — keep the deadline fresh.
                         deadline = Date().addingTimeInterval(inactivityWindow)
                     } else {
                         if !state.composerText.isEmpty && state.composerText == lastText {
@@ -673,8 +643,7 @@ final class DictationDriver {
                                 return
                             }
                         } else if state.composerText.isEmpty {
-                            // Composer is back and empty — transcript may land a
-                            // beat later, but an empty result is real after ~3s.
+                            // Composer back and empty — an empty result is real after ~3s.
                             emptyGrace += 1
                             if emptyGrace >= 12 {
                                 completion(.success(""))
@@ -693,8 +662,7 @@ final class DictationDriver {
         poll()
     }
 
-    /// DIAG: full forensic sequence, run via ECHOTYPE_DIAG=1 without the hotkey.
-    /// Logs evidence at each step; cancels any dictation it manages to start.
+    /// Full forensic sequence run via ECHOTYPE_DIAG=1; logs evidence at each step.
     func runDiagnostics(completion: (() -> Void)? = nil) {
         func step(_ label: String, _ expr: String, then: @escaping () -> Void) {
             call(expr) { result in
@@ -715,8 +683,7 @@ final class DictationDriver {
                 run()
             }
         }
-        // After the click: poll for engagement up to 60 s (the one observed success
-        // engaged somewhere inside a 39 s gap), then dump everything.
+        // Poll for engagement up to 60s, then dump everything.
         func pollEngagement(_ remaining: Int) {
             state { result in
                 if case .success(let s) = result {

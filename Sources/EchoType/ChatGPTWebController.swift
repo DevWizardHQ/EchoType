@@ -1,16 +1,36 @@
 import AppKit
+import Network
 import WebKit
 
-/// Owns the hidden WKWebView that hosts the logged-in chatgpt.com session,
-/// plus the same window in "login mode" (visible) for first-run sign-in.
-///
-/// Lifecycle follows `Settings.webviewPolicy`:
-///   - .alwaysReady: loaded at launch, never unloaded.
-///   - .keepWarm:    loaded on demand, unloaded after `Settings.keepWarmDuration` idle.
+/// Owns the hidden WKWebView hosting chatgpt.com; same window shown for login.
 final class ChatGPTWebController: NSObject {
     static let chatURL = URL(string: "https://chatgpt.com/")!
     /// Real Safari UA — avoids embedded-browser login blocks (Google SSO etc).
     private static let safariUA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+
+    private static let offlineHTML = """
+    <!doctype html><html><head><meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      html,body{height:100%;margin:0}
+      body{display:flex;align-items:center;justify-content:center;
+        font:15px -apple-system,system-ui,sans-serif;color:#e5e5e5;background:#1e1e1e}
+      .card{text-align:center;max-width:340px;padding:0 24px}
+      .icon{font-size:44px;margin-bottom:12px}
+      h1{font-size:19px;font-weight:600;margin:0 0 8px}
+      p{color:#a0a0a0;line-height:1.5;margin:0 0 24px}
+      button{font:inherit;font-weight:600;color:#fff;background:#10a37f;border:0;
+        border-radius:8px;padding:10px 22px;cursor:pointer}
+      button:hover{background:#0e8f6f}
+    </style></head><body>
+      <div class="card">
+        <div class="icon">📡</div>
+        <h1>No internet connection</h1>
+        <p>EchoType can't reach ChatGPT. Check your network, then try again.</p>
+        <button onclick="window.webkit.messageHandlers.retry.postMessage('retry')">Retry</button>
+      </div>
+    </body></html>
+    """
 
     private(set) var webView: WKWebView?
     private(set) var driver: DictationDriver?
@@ -21,13 +41,18 @@ final class ChatGPTWebController: NSObject {
     private var readyCallbacks: [(Result<Void, DictationDriver.Failure>) -> Void] = []
     private var loading = false
 
-    /// Set when login state changes; AppDelegate uses it to tint the menu icon.
+    // MARK: - Reachability
+    private let pathMonitor = NWPathMonitor()
+    private let pathQueue = DispatchQueue(label: "com.echotype.reachability")
+    private(set) var isOnline = true
+    private var showingOfflinePage = false
+
     var onLoginStateChange: ((Bool) -> Void)?
+    var onReachabilityChange: ((Bool) -> Void)?
 
     override init() {
         super.init()
-        // Display layout changes can strand the parked window fully offscreen,
-        // which freezes WebKit — re-park it whenever screens change.
+        // Screen changes can strand the parked window fully offscreen (freezes WebKit) — re-park.
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil, queue: .main
@@ -35,10 +60,49 @@ final class ChatGPTWebController: NSObject {
             guard let self, let window = self.window, !self.loginWindowVisible else { return }
             self.applyHiddenWindowMode(window)
         }
+        startReachabilityMonitor()
     }
 
-    /// Wired by AppDelegate: true while a dictation is in flight. The keep-warm
-    /// idle unload must never fire mid-dictation (sessions can run 30+ min).
+    // MARK: - Reachability
+
+    private func startReachabilityMonitor() {
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let online = path.status == .satisfied
+            DispatchQueue.main.async {
+                guard let self else { return }
+                let wasOnline = self.isOnline
+                self.isOnline = online
+                if wasOnline != online {
+                    Log.write("reachability: \(online ? "online" : "offline")")
+                    self.onReachabilityChange?(online)
+                }
+                if online, !wasOnline {
+                    self.recoverFromOffline()
+                }
+            }
+        }
+        pathMonitor.start(queue: pathQueue)
+    }
+
+    private func recoverFromOffline() {
+        if showingOfflinePage {
+            retryLoad()
+        } else if Settings.webviewPolicy == .alwaysReady, webView == nil, !loading {
+            ensureReady { _ in }
+        }
+    }
+
+    private func retryLoad() {
+        guard let webView else { showLoginWindow(); return }
+        showingOfflinePage = false
+        if driver == nil { driver = DictationDriver(webView: webView) }
+        loading = true
+        Log.write("webview: retrying \(Self.chatURL)")
+        webView.load(URLRequest(url: Self.chatURL))
+        beginActivity()
+        waitUntilInteractive(deadline: Date().addingTimeInterval(25))
+    }
+
     var isBusy: (() -> Bool)?
 
     // MARK: - Lifecycle
@@ -49,19 +113,21 @@ final class ChatGPTWebController: NSObject {
         }
     }
 
-    /// Loads the webview (if needed) and waits until chatgpt.com is interactive.
-    /// Callbacks queue up if a load is already in flight.
     func ensureReady(completion: @escaping (Result<Void, DictationDriver.Failure>) -> Void) {
         touch()
+        // Offline: fail fast instead of loading a blank frozen page for 25s.
+        if !isOnline, webView == nil {
+            Log.write("webview: ensureReady while offline — failing fast")
+            completion(.failure(.offline))
+            return
+        }
         if let driver, webView != nil, !loading {
-            // Already up — verify the page is actually alive and signed in.
             driver.state { [weak self] result in
                 switch result {
                 case .success(let state):
                     self?.onLoginStateChange?(state.loggedIn)
                     completion(state.loggedIn ? .success(()) : .failure(.loggedOut))
                 case .failure:
-                    // Web process died or page wedged — reload from scratch.
                     Log.write("webview: state probe failed, reloading")
                     self?.unload()
                     self?.ensureReady(completion: completion)
@@ -82,7 +148,7 @@ final class ChatGPTWebController: NSObject {
         waitUntilInteractive(deadline: Date().addingTimeInterval(25))
     }
 
-    /// Frees the WebContent process (~150-250 MB) while keeping cookies on disk.
+    /// Frees the WebContent process while keeping cookies on disk.
     func unload() {
         Log.write("webview: unloading")
         idleTimer?.invalidate()
@@ -96,8 +162,7 @@ final class ChatGPTWebController: NSObject {
         endActivity()
     }
 
-    /// Tears the page down and reloads it in the background — recovery path for
-    /// when chatgpt.com's dictation state machine wedges (click stops engaging).
+    /// Self-heal path for when chatgpt.com's dictation state machine wedges.
     func reloadInBackground() {
         unload()
         ensureReady { result in
@@ -105,7 +170,6 @@ final class ChatGPTWebController: NSObject {
         }
     }
 
-    /// Resets the keep-warm idle countdown (call on every dictation).
     func touch() {
         idleTimer?.invalidate()
         idleTimer = nil
@@ -113,14 +177,13 @@ final class ChatGPTWebController: NSObject {
         idleTimer = Timer.scheduledTimer(withTimeInterval: Settings.keepWarmDuration, repeats: false) { [weak self] _ in
             guard let self else { return }
             if self.isBusy?() == true {
-                self.touch() // dictating — restart the countdown instead of unloading
+                self.touch()
             } else {
                 self.unload()
             }
         }
     }
 
-    /// Re-applies the current policy (call when the setting changes).
     func policyChanged() {
         switch Settings.webviewPolicy {
         case .alwaysReady:
@@ -134,11 +197,21 @@ final class ChatGPTWebController: NSObject {
 
     // MARK: - Login window
 
-    /// Shows the (normally invisible) webview window so the user can sign in.
+    /// Menu-driven only; never auto-called, so logged-out/offline can't loop it open.
     func showLoginWindow() {
         loginWindowVisible = true
-        ensureReady { _ in } // make sure there is a page to log into
+        if !isOnline {
+            ensureWebViewForLogin()
+            presentOfflinePage()
+        } else {
+            showingOfflinePage = false
+            ensureReady { _ in }
+        }
         guard let window else { return }
+        showLoginChrome(window)
+    }
+
+    private func showLoginChrome(_ window: NSWindow) {
         window.alphaValue = 1
         window.hasShadow = true
         window.level = .normal
@@ -148,24 +221,36 @@ final class ChatGPTWebController: NSObject {
         NSApp.activate(ignoringOtherApps: true)
     }
 
+    /// Builds the webview + window without a network load (to host the offline page).
+    private func ensureWebViewForLogin() {
+        if webView == nil {
+            let webView = makeWebView()
+            self.webView = webView
+            self.driver = DictationDriver(webView: webView)
+            ensureWindow(contains: webView)
+        }
+    }
+
+    private func presentOfflinePage() {
+        guard let webView else { return }
+        showingOfflinePage = true
+        webView.stopLoading()
+        webView.loadHTMLString(Self.offlineHTML, baseURL: nil)
+    }
+
     func hideLoginWindow() {
         loginWindowVisible = false
         guard let window else { return }
         applyHiddenWindowMode(window)
     }
 
-    /// "Hidden" = visually imperceptible but still visible to WebKit: alpha 0
-    /// or an occluded window makes WebKit treat the page as hidden, which
-    /// blocks chatgpt.com's mic capture. Floating + 1% alpha keeps capture alive.
+    /// Imperceptible but still visible to WebKit — alpha 0 / occluded kills mic capture.
     private func applyHiddenWindowMode(_ window: NSWindow) {
         window.alphaValue = 0.01
-        window.hasShadow = false // a near-invisible window still casts a visible shadow
+        window.hasShadow = false
         window.level = .floating
         window.ignoresMouseEvents = true
-        // Park the window almost entirely offscreen (a 2-pt column stays on the
-        // bottom-right edge) so even the 1% ghost can't sit over the user's work.
-        // Some part MUST stay on screen: fully offscreen = occluded = WebKit
-        // freezes the page and dictation dies.
+        // Park nearly offscreen; a 2-pt sliver must stay on-screen or WebKit freezes.
         if let screen = NSScreen.main {
             let f = screen.frame
             window.setFrameOrigin(NSPoint(x: f.maxX - 2, y: f.minY + 40 - window.frame.height))
@@ -173,8 +258,7 @@ final class ChatGPTWebController: NSObject {
         window.orderFrontRegardless()
     }
 
-    /// WebKit mutes a webview's capture when it judges the view non-visible;
-    /// flip it back while a dictation is running.
+    /// WebKit mutes capture when it judges the view non-visible; force it active.
     func unmuteMicrophoneIfNeeded() {
         guard let webView else { return }
         if webView.microphoneCaptureState == .muted {
@@ -183,7 +267,6 @@ final class ChatGPTWebController: NSObject {
         }
     }
 
-    /// DIAG: how AppKit/WindowServer judge the hidden window.
     func logWindowState() {
         guard let window else { Log.write("diag: no window"); return }
         Log.write("diag: window isVisible=\(window.isVisible) occlusionVisible=\(window.occlusionState.contains(.visible)) alpha=\(window.alphaValue) frame=\(window.frame) screen=\(NSScreen.main?.frame ?? .zero)")
@@ -191,11 +274,7 @@ final class ChatGPTWebController: NSObject {
 
     // MARK: - Internals
 
-    /// chatgpt.com refuses to start dictation when the page reports itself hidden
-    /// or unfocused (our window is invisible and never key), so pin the Page
-    /// Visibility + focus APIs to "visible & focused". Also hooks getUserMedia
-    /// and console errors EARLY — before the site's bundle captures references —
-    /// so failures are diagnosable from the app log.
+    /// Pins Page Visibility + focus to visible/focused; hooks getUserMedia + console early.
     private static let visibilitySpoofScript = """
     (function () {
       try {
@@ -279,7 +358,7 @@ final class ChatGPTWebController: NSObject {
 
     private func makeWebView() -> WKWebView {
         let config = WKWebViewConfiguration()
-        config.websiteDataStore = .default() // persistent cookies → login survives restarts
+        config.websiteDataStore = .default()
         let controller = WKUserContentController()
         controller.addUserScript(WKUserScript(
             source: Self.visibilitySpoofScript,
@@ -291,6 +370,7 @@ final class ChatGPTWebController: NSObject {
             injectionTime: .atDocumentEnd,
             forMainFrameOnly: true
         ))
+        controller.add(self, name: "retry")
         config.userContentController = controller
 
         let webView = WKWebView(frame: NSRect(x: 0, y: 0, width: 1100, height: 760), configuration: config)
@@ -300,9 +380,8 @@ final class ChatGPTWebController: NSObject {
         return webView
     }
 
-    /// One window serves both modes: alpha 0 + mouse-transparent when hidden,
-    /// normal when shown for login. Staying ordered on screen (rather than
-    /// orderOut) keeps WebKit from throttling timers and media capture.
+    /// One window, two modes: hidden (alpha 0) or visible for login. Stays ordered
+    /// on screen (never orderOut) so WebKit keeps timers and media capture alive.
     private func ensureWindow(contains webView: WKWebView) {
         if window == nil {
             let window = OffscreenCapableWindow(
@@ -314,25 +393,17 @@ final class ChatGPTWebController: NSObject {
             window.title = "EchoType — ChatGPT Login"
             window.isReleasedWhenClosed = false
             window.delegate = self
-            // .canJoinAllSpaces is load-bearing: without it the window stays on
-            // the Space it was created on; after the user switches Space the
-            // WindowServer marks it occluded and WebKit freezes the page —
-            // which silently kills chatgpt.com's dictation.
+            // .canJoinAllSpaces: else switching Space occludes the window and freezes WebKit.
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
             self.window = window
         }
         window?.contentView = webView
-        // A freshly created window starts at alpha 1 but is NOT ordered on
-        // screen — and an unordered window freezes WebKit's render pipeline,
-        // which silently kills chatgpt.com's dictation flow. Always order it,
-        // hidden unless the login window is currently being shown.
+        // Must be ordered on-screen (hidden) or WebKit's render pipeline freezes.
         if let window, !loginWindowVisible {
             applyHiddenWindowMode(window)
         }
     }
 
-    /// Polls the page until the composer renders (SPA hydration takes a beat
-    /// after didFinish), then drains the ready queue.
     private func waitUntilInteractive(deadline: Date) {
         guard loading, let driver else { return }
         driver.state { [weak self] result in
@@ -344,7 +415,6 @@ final class ChatGPTWebController: NSObject {
                 self.onLoginStateChange?(true)
                 self.flushReadyCallbacks(.success(()))
             case .success:
-                // Page is up but logged out (or composer not yet hydrated).
                 if Date() > deadline {
                     Log.write("webview: ready but logged OUT")
                     self.loading = false
@@ -375,7 +445,7 @@ final class ChatGPTWebController: NSObject {
         callbacks.forEach { $0(result) }
     }
 
-    /// Keeps the app (and the webview's media capture) out of App Nap while loaded.
+    /// Keeps the app (and its media capture) out of App Nap while loaded.
     private func beginActivity() {
         guard activityToken == nil else { return }
         activityToken = ProcessInfo.processInfo.beginActivity(
@@ -392,9 +462,7 @@ final class ChatGPTWebController: NSObject {
     }
 }
 
-/// AppKit normally constrains titled windows onto the screen; hidden mode needs
-/// to park the webview window almost entirely OFF screen (with a 2-pt sliver
-/// left visible so WebKit keeps rendering).
+/// Skips AppKit's on-screen constraint so hidden mode can park nearly offscreen.
 private final class OffscreenCapableWindow: NSWindow {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect {
         frameRect
@@ -404,8 +472,6 @@ private final class OffscreenCapableWindow: NSWindow {
 // MARK: - WKUIDelegate
 
 extension ChatGPTWebController: WKUIDelegate {
-    /// Auto-grant the page's microphone request — the OS-level mic permission
-    /// is still enforced against the app itself.
     func webView(_ webView: WKWebView,
                  requestMediaCapturePermissionFor origin: WKSecurityOrigin,
                  initiatedByFrame frame: WKFrameInfo,
@@ -421,8 +487,6 @@ extension ChatGPTWebController: WKUIDelegate {
 extension ChatGPTWebController: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         Log.write("webview: didFinish \(webView.url?.absoluteString ?? "?")")
-        // Landing back on chatgpt.com (e.g. after the user signs in via the login
-        // window) — re-probe so the menu icon updates and the window auto-hides.
         guard webView.url?.host?.hasSuffix("chatgpt.com") == true, !loading else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             guard let self, let driver = self.driver else { return }
@@ -439,8 +503,37 @@ extension ChatGPTWebController: WKNavigationDelegate {
         }
     }
 
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        Log.write("webview: didFailProvisionalNavigation \(error.localizedDescription)")
+        handleNavigationFailure(error)
+    }
+
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         Log.write("webview: didFail \(error.localizedDescription)")
+        handleNavigationFailure(error)
+    }
+
+    private func handleNavigationFailure(_ error: Error) {
+        guard isNetworkError(error) else { return }
+        loading = false
+        flushReadyCallbacks(.failure(.offline))
+        if loginWindowVisible {
+            presentOfflinePage()
+        }
+    }
+
+    private func isNetworkError(_ error: Error) -> Bool {
+        let e = error as NSError
+        guard e.domain == NSURLErrorDomain else { return false }
+        switch e.code {
+        case NSURLErrorNotConnectedToInternet, NSURLErrorNetworkConnectionLost,
+             NSURLErrorCannotConnectToHost, NSURLErrorCannotFindHost,
+             NSURLErrorDNSLookupFailed, NSURLErrorTimedOut,
+             NSURLErrorInternationalRoamingOff, NSURLErrorDataNotAllowed:
+            return true
+        default:
+            return false
+        }
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -449,11 +542,20 @@ extension ChatGPTWebController: WKNavigationDelegate {
     }
 }
 
+// MARK: - WKScriptMessageHandler
+
+extension ChatGPTWebController: WKScriptMessageHandler {
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "retry" else { return }
+        Log.write("webview: retry from offline page")
+        retryLoad()
+    }
+}
+
 // MARK: - NSWindowDelegate
 
 extension ChatGPTWebController: NSWindowDelegate {
-    /// Closing the login window hides it back into invisible mode instead of
-    /// destroying the session.
+    /// Closing the login window hides it instead of destroying the session.
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         hideLoginWindow()
         return false
