@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.6] - 2026-09-06
+
+### Fixed
+
+- Dictation not pasting into terminals that expose no accessibility tree (e.g. Warp, Ghostty), where no focused element can be resolved at all. The transcript is now pasted into the frontmost app in that case, instead of being diverted to the clipboard — unless the frontmost app is EchoType itself or the Finder/desktop. The frontmost app name is logged.
+
 ## [1.0.5] - 2026-09-06
 
 ### Fixed

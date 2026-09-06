@@ -75,10 +75,26 @@ enum Paster {
     /// fall through to the clipboard. Poorly-accessible apps (terminals like
     /// Warp/Ghostty) expose an opaque focused view — treat that as a text target
     /// rather than losing the paste, matching pre-1.0.3 behavior.
+    // Apps whose "focus" is never a text target; dictating here goes to the
+    // clipboard rather than pasting into nothing.
+    private static let nonTextBundleIDs: Set<String> = [
+        "com.apple.finder",
+    ]
+
     private static func hasTextTarget() -> Bool {
         guard let axElement = focusedElement() else {
-            Log.write("paste: no focused element — copying to clipboard")
-            return false
+            // Some terminals (Warp, Ghostty) expose no accessibility element at
+            // all. Rather than lose the paste, type into the frontmost app unless
+            // it is our own app or a known non-text app (the desktop/Finder).
+            let front = NSWorkspace.shared.frontmostApplication
+            let bundleID = front?.bundleIdentifier ?? "?"
+            let name = front?.localizedName ?? "?"
+            if bundleID == Bundle.main.bundleIdentifier || nonTextBundleIDs.contains(bundleID) {
+                Log.write("paste: no focused element, frontmost=\(name) — copying to clipboard")
+                return false
+            }
+            Log.write("paste: no focused element, frontmost=\(name) — pasting anyway")
+            return true
         }
 
         var role = "<none>"
