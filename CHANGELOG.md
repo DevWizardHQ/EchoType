@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.5] - 2026-09-06
+
+### Fixed
+
+- Dictation still not pasting into terminals after 1.0.4: the system-wide `AXFocusedUIElement` lookup returns nothing for some apps (terminals), so detection saw "no focused element" and diverted to the clipboard. It now falls back to the frontmost application's own focused element, which those apps do expose.
+
 ## [1.0.4] - 2026-09-06
 
 ### Fixed
