@@ -9,6 +9,7 @@ struct SettingsView: View {
     @State private var policy = Settings.webviewPolicy
     @State private var keepWarm = Settings.keepWarmDuration
     @State private var autoUpdates = Settings.autoCheckUpdates
+    @State private var keepOnClipboard = Settings.keepTranscriptOnClipboard
 
     var body: some View {
         Form {
@@ -60,6 +61,18 @@ struct SettingsView: View {
                             launchAtLogin = SMAppService.mainApp.status == .enabled
                         }
                     }
+            }
+
+            Section("Dictation") {
+                Toggle("Keep transcript on clipboard", isOn: $keepOnClipboard)
+                    .onChange(of: keepOnClipboard) { _, enabled in
+                        Settings.keepTranscriptOnClipboard = enabled
+                    }
+                Text(keepOnClipboard
+                     ? "Each transcript is pasted and stays on the clipboard, so you can paste it again. Your previous clipboard is replaced."
+                     : "Each transcript is pasted, then your previous clipboard is restored. Transcripts that can't be pasted still stay on the clipboard.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Updates") {

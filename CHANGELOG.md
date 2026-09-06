@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.7] - 2026-09-06
+
+### Added
+
+- "Keep transcript on clipboard" setting (Settings → Dictation, on by default). When on, each transcript is pasted and stays on the clipboard so it can be pasted again. When off, the previous clipboard is restored after pasting (the earlier behavior). Transcripts that can't be pasted always stay on the clipboard regardless.
+
 ## [1.0.6] - 2026-09-06
 
 ### Fixed

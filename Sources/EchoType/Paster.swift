@@ -13,12 +13,18 @@ enum Paster {
 
     @discardableResult
     static func deliver(_ text: String) -> Outcome {
-        if hasTextTarget() {
-            paste(text)
-            return .pasted
+        guard hasTextTarget() else {
+            // Nowhere to paste — always leave the transcript on the clipboard.
+            copy(text)
+            return .copiedToClipboard
         }
-        copy(text)
-        return .copiedToClipboard
+        if Settings.keepTranscriptOnClipboard {
+            copy(text)
+            synthesizeCmdV()
+        } else {
+            pasteRestoringClipboard(text)
+        }
+        return .pasted
     }
 
     private static func copy(_ text: String) {
@@ -27,7 +33,8 @@ enum Paster {
         pasteboard.setString(text, forType: .string)
     }
 
-    private static func paste(_ text: String) {
+    /// Pastes, then restores whatever was previously on the clipboard.
+    private static func pasteRestoringClipboard(_ text: String) {
         let pasteboard = NSPasteboard.general
         let savedString = pasteboard.string(forType: .string)
 
