@@ -13,7 +13,7 @@ enum Paster {
 
     @discardableResult
     static func deliver(_ text: String) -> Outcome {
-        if focusedElementIsEditable() {
+        if hasTextTarget() {
             paste(text)
             return .pasted
         }
@@ -44,32 +44,77 @@ enum Paster {
         }
     }
 
-    private static func focusedElementIsEditable() -> Bool {
+    private static let editableRoles: Set<String> = [
+        kAXTextFieldRole as String,
+        kAXTextAreaRole as String,
+        kAXComboBoxRole as String,
+        "AXSearchField",
+    ]
+
+    // Recognized controls that never accept typed text — the only case where we
+    // divert to the clipboard instead of pasting.
+    private static let nonTextRoles: Set<String> = [
+        kAXButtonRole as String,
+        kAXCheckBoxRole as String,
+        kAXRadioButtonRole as String,
+        kAXPopUpButtonRole as String,
+        kAXMenuButtonRole as String,
+        kAXMenuItemRole as String,
+        kAXMenuRole as String,
+        kAXMenuBarRole as String,
+        kAXSliderRole as String,
+        kAXImageRole as String,
+        "AXLink",
+        "AXTab",
+        kAXDisclosureTriangleRole as String,
+        kAXColorWellRole as String,
+    ]
+
+    /// Whether ⌘V would land somewhere useful. Biased toward pasting: only the
+    /// clear no-text cases (no focused element, or a recognized non-text control)
+    /// fall through to the clipboard. Poorly-accessible apps (terminals like
+    /// Warp/Ghostty) expose an opaque focused view — treat that as a text target
+    /// rather than losing the paste, matching pre-1.0.3 behavior.
+    private static func hasTextTarget() -> Bool {
         let system = AXUIElementCreateSystemWide()
         var focused: AnyObject?
         guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
               let element = focused else {
+            Log.write("paste: no focused element — copying to clipboard")
             return false
         }
         let axElement = element as! AXUIElement
 
+        var role = "<none>"
         var roleValue: AnyObject?
         if AXUIElementCopyAttributeValue(axElement, kAXRoleAttribute as CFString, &roleValue) == .success,
-           let role = roleValue as? String {
-            let editableRoles: Set<String> = [
-                kAXTextFieldRole as String,
-                kAXTextAreaRole as String,
-                kAXComboBoxRole as String,
-                "AXSearchField",
-            ]
-            if editableRoles.contains(role) { return true }
+           let r = roleValue as? String {
+            role = r
         }
 
+        let settable = isValueSettable(axElement)
+        let hasCaret = hasAttribute(axElement, kAXSelectedTextRangeAttribute as String)
+            || hasAttribute(axElement, kAXInsertionPointLineNumberAttribute as String)
+        Log.write("paste: focused role=\(role) settable=\(settable) caret=\(hasCaret)")
+
+        if editableRoles.contains(role) { return true }
+        if settable || hasCaret { return true }
+        if nonTextRoles.contains(role) { return false }
+        // Unknown/opaque focus with something focused — paste rather than lose it.
+        return true
+    }
+
+    private static func isValueSettable(_ element: AXUIElement) -> Bool {
         var settable: DarwinBoolean = false
-        if AXUIElementIsAttributeSettable(axElement, kAXValueAttribute as CFString, &settable) == .success {
-            return settable.boolValue
+        guard AXUIElementIsAttributeSettable(element, kAXValueAttribute as CFString, &settable) == .success else {
+            return false
         }
-        return false
+        return settable.boolValue
+    }
+
+    private static func hasAttribute(_ element: AXUIElement, _ attr: String) -> Bool {
+        var value: AnyObject?
+        return AXUIElementCopyAttributeValue(element, attr as CFString, &value) == .success
     }
 
     private static func synthesizeCmdV() {

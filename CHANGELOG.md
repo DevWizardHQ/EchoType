@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-09-06
+
+### Fixed
+
+- Dictation not pasting into terminals (Terminal.app, iTerm2, Warp, Ghostty) and other apps with non-standard accessibility: the transcript was diverted to the clipboard instead of being typed at the cursor. Paste detection is now biased toward pasting — it only falls back to the clipboard when there is clearly no text target (no focused element, or a recognized non-text control such as a button). The focused element's role and text attributes are logged to aid diagnosis.
+
 ## [1.0.3] - 2026-09-05
 
 ### Fixed
