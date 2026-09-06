@@ -93,11 +93,19 @@ enum Settings {
         static let webviewPolicy = "webviewPolicy"
         static let keepWarmDuration = "keepWarmDuration"
         static let autoCheckUpdates = "autoCheckUpdates"
+        static let keepTranscriptOnClipboard = "keepTranscriptOnClipboard"
     }
 
     static var autoCheckUpdates: Bool {
         get { defaults.object(forKey: Key.autoCheckUpdates) as? Bool ?? true }
         set { defaults.set(newValue, forKey: Key.autoCheckUpdates) }
+    }
+
+    /// When true, each transcript stays on the clipboard after dictation instead
+    /// of the previous clipboard being restored.
+    static var keepTranscriptOnClipboard: Bool {
+        get { defaults.object(forKey: Key.keepTranscriptOnClipboard) as? Bool ?? true }
+        set { defaults.set(newValue, forKey: Key.keepTranscriptOnClipboard) }
     }
 
     static var dictateHotkey: HotkeyConfig {
