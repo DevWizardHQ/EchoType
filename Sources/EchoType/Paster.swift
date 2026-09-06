@@ -76,14 +76,10 @@ enum Paster {
     /// Warp/Ghostty) expose an opaque focused view — treat that as a text target
     /// rather than losing the paste, matching pre-1.0.3 behavior.
     private static func hasTextTarget() -> Bool {
-        let system = AXUIElementCreateSystemWide()
-        var focused: AnyObject?
-        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
-              let element = focused else {
+        guard let axElement = focusedElement() else {
             Log.write("paste: no focused element — copying to clipboard")
             return false
         }
-        let axElement = element as! AXUIElement
 
         var role = "<none>"
         var roleValue: AnyObject?
@@ -102,6 +98,26 @@ enum Paster {
         if nonTextRoles.contains(role) { return false }
         // Unknown/opaque focus with something focused — paste rather than lose it.
         return true
+    }
+
+    /// The focused UI element. The system-wide `AXFocusedUIElement` is empty for
+    /// some apps (terminals), so fall back to the frontmost application's own
+    /// focused element.
+    private static func focusedElement() -> AXUIElement? {
+        let system = AXUIElementCreateSystemWide()
+        var focused: AnyObject?
+        if AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+           let element = focused {
+            return (element as! AXUIElement)
+        }
+        guard let pid = NSWorkspace.shared.frontmostApplication?.processIdentifier else { return nil }
+        let appElement = AXUIElementCreateApplication(pid)
+        var appFocused: AnyObject?
+        if AXUIElementCopyAttributeValue(appElement, kAXFocusedUIElementAttribute as CFString, &appFocused) == .success,
+           let element = appFocused {
+            return (element as! AXUIElement)
+        }
+        return nil
     }
 
     private static func isValueSettable(_ element: AXUIElement) -> Bool {
